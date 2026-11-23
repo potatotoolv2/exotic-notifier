@@ -977,32 +977,46 @@ def parse_database(filepath: str) -> dict[str, PlayerExoticData]:
         line = raw_line.strip()
         if not line:
             continue
-        if line.lower().startswith("playeruuid"):
+        head = line.split("|", 1)[0].split(",", 1)[0].strip().lower()
+        if head in {"playeruuid", "uuid"}:
             continue
 
         try:
-            parts = line.split(",")
-            if len(parts) < 3:
+            username = ""
+            category = ""
+            if "|" in line:
+                parts = [part.strip() for part in line.split("|")]
+                if len(parts) < 4:
+                    continue
+                player_uuid = parts[0].replace("-", "").lower()
+                color = parts[1].lstrip("#")
+                hex_code, _, category = color.partition("/")
+                item_id = parts[2]
+                username = parts[3]
+            else:
+                parts = [part.strip() for part in line.split(",")]
+                if len(parts) < 3:
+                    continue
+                player_uuid = parts[0].replace("-", "").lower()
+                item_id = parts[1]
+                hex_code = parts[2].lstrip("#")
+
+            if not player_uuid or not item_id or len(player_uuid) != 32:
                 continue
 
-            player_uuid = parts[0].strip().lower()
-            item_id = parts[1].strip()
-            hex_code = parts[2].strip().lstrip("#")
+            player = players.get(player_uuid)
+            if player is None:
+                player = PlayerExoticData(player_uuid, username)
+                players[player_uuid] = player
+            elif username and not player.player_name:
+                player.player_name = username
 
-            if not player_uuid or not item_id:
-                continue
-            if len(player_uuid) != 32:
-                continue
-
-            if player_uuid not in players:
-                players[player_uuid] = PlayerExoticData(player_uuid, "")
-
-            players[player_uuid].add_item(ExoticItem(
+            player.add_item(ExoticItem(
                 item_uuid="",
                 hex_code=hex_code,
                 item_id=item_id,
                 rarity="",
-                reforge="",
+                reforge=category,
             ))
         except Exception as e:
             print(f"[DB] Line {line_num}: {e}")
@@ -6043,12 +6057,12 @@ async def cmd_status(interaction: discord.Interaction):
     await interaction.followup.send(embed=embed)
 
 
-@bot.tree.command(name="setcsv", description="Set the local CSV path on this PC")
+@bot.tree.command(name="setcsv", description="Set the player list path (.csv or uuid|hex/category|item_id|username .txt)")
 async def cmd_setcsv(interaction: discord.Interaction, path: str):
     owner_id = interaction.guild.owner_id if interaction.guild else None
     if not is_admin(interaction.user) and (owner_id is None or interaction.user.id != owner_id):
         await interaction.response.send_message(
-            "The player list is the shared CSV. You can't load a different file.",
+            "The player list is the shared one. You can't load a different file.",
             ephemeral=True,
         )
         return
@@ -6058,6 +6072,14 @@ async def cmd_setcsv(interaction: discord.Interaction, path: str):
         await interaction.response.send_message(
             f"File not found on this PC: `{path}`", ephemeral=True)
         return
+    loaded = parse_database(path)
+    if not loaded:
+        await interaction.response.send_message(
+            "That file has no players. Use a CSV, or a .txt with "
+            "`uuid|hex/category|item_id|username`.",
+            ephemeral=True,
+        )
+        return
     DATABASE_FILE = os.path.abspath(path)
     os.environ["DATABASE_FILE"] = DATABASE_FILE
     cfg = load_config()
@@ -6065,11 +6087,12 @@ async def cmd_setcsv(interaction: discord.Interaction, path: str):
     if BOT_TOKEN:
         cfg["discord_token"] = BOT_TOKEN
     save_config(cfg)
-    bot.db = parse_database(DATABASE_FILE)
+    bot.db = loaded
     bot._rebuild_scan_list()
+    items = sum(len(player.items) for player in bot.db.values())
     await interaction.response.send_message(
-        f"CSV → `{DATABASE_FILE}`\n"
-        f"**{len(bot.db)}** players queued **{len(bot.players_to_scan)}**",
+        f"Player list → `{DATABASE_FILE}`\n"
+        f"**{len(bot.db)}** players, **{items}** items, **{len(bot.players_to_scan)}** queued",
         ephemeral=True,
     )
 
