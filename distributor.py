@@ -21,7 +21,16 @@ import zipfile
 import aiohttp
 import discord
 
-INVITE_PERMISSIONS = 117760  # view, send, embed, attach, history
+# Only bits phonktester can put on the Scanner invite role. The invite link
+# has to be a subset of that role or Discord rejects it.
+INVITE_BITS = (
+    "view_channel",
+    "send_messages",
+    "send_messages_in_threads",
+    "embed_links",
+    "attach_files",
+    "read_message_history",
+)
 PORTAL_URL = "https://discord.com/developers/applications"
 
 
@@ -547,15 +556,24 @@ def build_package(
     return data
 
 
-def _invite_url(application_id: str, guild_id: int | None) -> str:
+def _invite_url(application_id: str, guild_id: int | None, permissions: int) -> str:
     url = (
         "https://discord.com/oauth2/authorize"
-        f"?client_id={application_id}&permissions={INVITE_PERMISSIONS}"
+        f"?client_id={application_id}&permissions={int(permissions)}"
         "&scope=bot%20applications.commands"
     )
     if guild_id:
         url += f"&guild_id={guild_id}&disable_guild_select=true"
     return url
+
+
+def bot_invite_bits(role: discord.Role) -> int:
+    """Permissions the invite may ask for. Manage Server stays off the bot."""
+    value = 0
+    for name in INVITE_BITS:
+        if getattr(role.permissions, name, False):
+            value |= discord.Permissions(**{name: True}).value
+    return value
 
 
 async def _bot_identity(token: str) -> dict | None:
@@ -631,15 +649,21 @@ def _can_invite_without_setup_role(member: discord.Member, setup_role_id: int | 
     return bool(perms.administrator or perms.manage_guild)
 
 
-def invite_role_permissions() -> discord.Permissions:
-    """Manage Server plus every permission the bot invite asks for."""
-    perms = discord.Permissions(INVITE_PERMISSIONS)
-    perms.update(manage_guild=True)
-    return perms
+def invite_role_permissions(guild: discord.Guild) -> discord.Permissions:
+    """Manage Server, plus every bot permission this bot is allowed to grant."""
+    me = guild.me
+    have = me.guild_permissions if me is not None else discord.Permissions.none()
+    wanted = discord.Permissions.none()
+    if have.manage_guild:
+        wanted.manage_guild = True
+    for name in INVITE_BITS:
+        if getattr(have, name, False):
+            setattr(wanted, name, True)
+    return wanted
 
 
 async def _setup_role(guild: discord.Guild) -> discord.Role:
-    wanted = invite_role_permissions()
+    wanted = invite_role_permissions(guild)
     role = None
     saved = _saved_role_id(guild.id)
     if saved:
@@ -693,6 +717,12 @@ async def grant_inviter(client, member: discord.Member) -> tuple[bool, str]:
             )
         if role not in member.roles:
             await member.add_roles(role, reason="/adduser can add a scanner bot")
+        member = await guild.fetch_member(member.id)
+        if role not in member.roles:
+            return False, (
+                "phonktester could not give you **Scanner invite**. "
+                "Move phonktester's role above **Scanner invite**, then paste the token again."
+            )
     except discord.Forbidden:
         return False, (
             "phonktester can't grant Manage Server yet, so Discord will reject the bot invite. "
@@ -736,20 +766,34 @@ async def _revoke_inviter(client, guild_id: int, user_id: int) -> None:
     _granted(client).discard(user_id)
 
 
-async def _watch_inviter(client, guild_id: int, user_id: int, app_id: str | None) -> None:
+async def _member_in_guild(client, guild_id: int, user_id: str | None) -> bool:
+    if not user_id or not str(user_id).isdigit():
+        return False
+    guild = client.get_guild(guild_id)
+    if guild is None:
+        return False
     try:
-        for _ in range(INVITER_WINDOW_SEC // 30):
-            if app_id:
-                guild = client.get_guild(guild_id)
-                if guild is not None:
-                    try:
-                        await guild.fetch_member(int(app_id))
-                        break
-                    except discord.NotFound:
-                        pass
-                    except Exception as e:
-                        print(f"[adduser] invite check: {type(e).__name__}")
-            await asyncio.sleep(30)
+        await guild.fetch_member(int(user_id))
+        return True
+    except discord.NotFound:
+        return False
+    except Exception as e:
+        print(f"[adduser] invite check: {type(e).__name__}")
+        return False
+
+
+async def _watch_inviter(client, guild_id: int, user_id: int, app_id: str | None) -> None:
+    """Take the invite role away only after the bot actually joins from outside."""
+    try:
+        present = await _member_in_guild(client, guild_id, app_id)
+        for _ in range(INVITER_WINDOW_SEC // 15):
+            await asyncio.sleep(15)
+            if not app_id:
+                continue
+            here = await _member_in_guild(client, guild_id, app_id)
+            if here and not present:
+                break
+            present = here
         await _revoke_inviter(client, guild_id, user_id)
     except asyncio.CancelledError:
         return
@@ -801,6 +845,9 @@ class TokenModal(discord.ui.Modal, title="Paste your bot token"):
 
         role_note = ""
         if isinstance(interaction.user, discord.Member) and interaction.guild_id:
+            stop = getattr(interaction.client, "force_stop_scanner", None)
+            if callable(stop):
+                await stop(interaction.user.id, str(ident["id"]), token)
             ok, note = await grant_inviter(interaction.client, interaction.user)
             if ok and note:
                 role_note = note
@@ -864,7 +911,12 @@ class TokenModal(discord.ui.Modal, title="Paste your bot token"):
             )
             return
 
-        url = _invite_url(str(ident["id"]), interaction.guild_id)
+        permissions = discord.Permissions(view_channel=True, send_messages=True).value
+        if interaction.guild is not None:
+            invite_role = discord.utils.get(interaction.guild.roles, name=INVITER_ROLE_NAME)
+            if invite_role is not None:
+                permissions = bot_invite_bits(invite_role) or permissions
+        url = _invite_url(str(ident["id"]), interaction.guild_id, permissions)
         invite_note = "1. Add it to this server. You have Manage Server for this invite:"
         if role_note:
             invite_note = "1. " + role_note

@@ -67,7 +67,7 @@ from licensing import (
     is_frozen,
 )
 from user_setup import load_config, run_wizard, save_config
-from distributor import AddUserView, ensure_invite_role, register_adduser
+from distributor import PORTAL_URL, AddUserView, ensure_invite_role, register_adduser
 
 load_dotenv()
 configure_event_loop()
@@ -1956,6 +1956,7 @@ class ExoticBot(commands.Bot):
         self._license_task: Optional[asyncio.Task] = None
         self._power_task: Optional[asyncio.Task] = None
         self._board_task: Optional[asyncio.Task] = None
+        self._kill_task: Optional[asyncio.Task] = None
         self._access_task: Optional[asyncio.Task] = None
         self._relay_task: Optional[asyncio.Task] = None
 
@@ -2022,7 +2023,7 @@ class ExoticBot(commands.Bot):
         guilds = list(self.guilds)
         if not guilds:
             print("[Bot] This bot is not in any server yet, so /start has nothing to reach.")
-            print("[Bot] Invite this bot, then restart Discord.")
+            print("[Bot] Invite phonktester, then restart Discord.")
             return
         for guild in guilds:
             try:
@@ -2066,6 +2067,7 @@ class ExoticBot(commands.Bot):
                 print(f"[Bot] Join sync failed: {e}")
             return
         await self._post_manage_page()
+        await self._post_setup_page()
         try:
             await self._sync_guild(guild)
             await self.http.bulk_upsert_global_commands(self.application_id, [])
@@ -2087,6 +2089,8 @@ class ExoticBot(commands.Bot):
                 await self._drop_my_boards()
                 if not self._board_task or self._board_task.done():
                     self._board_task = asyncio.create_task(self._leaderboard_loop())
+                if not self._kill_task or self._kill_task.done():
+                    self._kill_task = asyncio.create_task(self._kill_watch())
                 return
             if self.keep_scanning and not self.ending_session:
                 self._ensure_scanner()
@@ -2097,6 +2101,7 @@ class ExoticBot(commands.Bot):
             await self._publish_updates()
             await self._hide_public_logs()
             await self._post_manage_page()
+            await self._post_setup_page()
             await self._publish_revoked()
             await self._sync_ledger_members()
             await self._tuck_ledger(await self._ledger_thread())
@@ -2359,12 +2364,8 @@ class ExoticBot(commands.Bot):
                 keep = False
             if keep:
                 continue
-            try:
-                await thread.delete(reason="No scanner bot in the server")
-                print(f"[manage] Removed {thread.name}")
-            except Exception as e:
-                print(f"[manage] remove thread: {type(e).__name__}: {e}")
-            drop.append(uid)
+            if await self._eject_thread(thread, user_id, ""):
+                drop.append(uid)
         mapped = set()
         for tid in data.values():
             try:
@@ -2683,6 +2684,77 @@ class ExoticBot(commands.Bot):
             await ch.send(text, view=view)
         except Exception as e:
             print(f"[manage] {e}")
+
+    def _setup_text(self) -> str:
+        claim = self._claim_channel()
+        manage = self._named_channel("mange-your-noti") or self._named_channel("manage-your-noti")
+        claim_bit = claim.mention if claim else "#claim"
+        manage_bit = manage.mention if manage else "#mange-your-noti"
+        return (
+            "**Setup**\n"
+            "The scanner runs on your computer. You use your own bot token. "
+            "Finds show up in this server.\n\n"
+            "**1. Install Python 3.12**\n"
+            "Use the **Python 3.12** button. On Windows, check **Add python.exe to PATH**.\n\n"
+            "**2. Create a bot and copy the token**\n"
+            "Use **Create a bot**. Open **Bot**, click **Reset Token**, and copy it. "
+            "It has to be a new bot. It cannot be phonktester.\n\n"
+            "**3. Paste the token**\n"
+            "Click **Paste token** below. Check your DMs for a small zip and an invite link.\n\n"
+            "**4. Add your bot**\n"
+            "Open the invite link in that DM and add the bot to this server.\n\n"
+            "**5. Start the loader**\n"
+            "Unzip the download and double-click one file. Leave that window open.\n"
+            "Windows: `start.bat`\n"
+            "Mac: `Start ExoticNotifier.command`\n"
+            "If Mac says it cannot be opened, right-click the file, choose Open, then Open.\n"
+            "The loader downloads the scanner and starts your bot. "
+            "One small Chrome window opens. Leave that window open. Do not start the loader twice.\n\n"
+            "**6. Open your thread**\n"
+            f"When your bot is in the server, open {manage_bit} and click **Open my notifier**.\n"
+            "Run `/start` and `/stop` in that thread on **your** bot.\n\n"
+            f"Online hits are posted in {claim_bit}. A claim costs {CLAIM_COST} scans.\n"
+            "Do not share the zip. It has your bot token."
+        )
+
+    def _setup_view(self) -> AddUserView:
+        view = AddUserView()
+        view.add_item(discord.ui.Button(
+            label="Python 3.12",
+            url="https://www.python.org/downloads/release/python-31210/",
+            row=1,
+        ))
+        view.add_item(discord.ui.Button(
+            label="Create a bot",
+            url=PORTAL_URL,
+            row=1,
+        ))
+        return view
+
+    async def _post_setup_page(self) -> None:
+        if not self._is_directory():
+            return
+        channel = self._named_channel("setup")
+        if channel is None:
+            print("[setup] No #setup channel.")
+            return
+        text = self._setup_text()
+        view = self._setup_view()
+        kept = False
+        try:
+            async for msg in channel.history(limit=30):
+                if msg.author != self.user or not (msg.content or "").startswith("**Setup**"):
+                    continue
+                if not kept:
+                    await msg.edit(content=text, embeds=[], view=view)
+                    kept = True
+                else:
+                    await msg.delete()
+            if not kept:
+                await channel.send(text, view=view)
+            print("[setup] Page ready.")
+        except Exception as e:
+            print(f"[setup] {type(e).__name__}: {e}")
 
     def _public_embed(self, exotic: PlayerExoticData,
                       profile: Optional[Sk1erProfile] = None) -> discord.Embed:
@@ -4125,6 +4197,215 @@ class ExoticBot(commands.Bot):
             bank["spent"] = spent
             save_bank(bank)
 
+    def _mark_pending_stop(self, user_id: int) -> None:
+        data = load_operators()
+        stops = [str(item) for item in data.get("pending_stops") or [] if str(item).isdigit()]
+        if str(user_id) not in stops:
+            stops.append(str(user_id))
+        data["pending_stops"] = stops
+        save_operators(data)
+
+    def _clear_pending_stop(self, user_id: int) -> None:
+        data = load_operators()
+        data["pending_stops"] = [
+            str(item) for item in data.get("pending_stops") or []
+            if str(item).isdigit() and str(item) != str(user_id)
+        ]
+        save_operators(data)
+
+    async def _kill_watch(self) -> None:
+        """Customer scanners exit within a few seconds of a reset or revoke."""
+        while not self.ending_session:
+            if await self._stop_if_revoked():
+                return
+            await asyncio.sleep(3)
+
+    async def _dm_account(self, user_id: int, word: str) -> None:
+        try:
+            user = self.get_user(int(user_id)) or await self.fetch_user(int(user_id))
+            await user.send(f"Your account has been {word}.")
+            print(f"[admin] DMed {user_id}: {word}")
+        except Exception as e:
+            print(f"[admin] DM {word}: {type(e).__name__}: {e}")
+
+    async def _eject_thread(self, thread: discord.Thread, user_id, bot_id: str = "") -> bool:
+        """Pull the person and their bot out of the thread. Delete it when Discord allows."""
+        if thread.name == "Admin":
+            return False
+        left = False
+        for uid in (user_id, bot_id):
+            if not str(uid).isdigit():
+                continue
+            try:
+                await thread.remove_user(discord.Object(id=int(uid)))
+                left = True
+                print(f"[admin] {uid} left {thread.name}")
+            except discord.NotFound:
+                pass
+            except Exception as e:
+                print(f"[admin] leave thread: {type(e).__name__}: {e}")
+        failed = getattr(self, "_thread_delete_failed", None)
+        if failed is None:
+            failed = set()
+            self._thread_delete_failed = failed
+        if thread.id not in failed:
+            try:
+                await thread.delete(reason="Account reset")
+                left = True
+                print(f"[admin] Deleted {thread.name}")
+            except discord.Forbidden:
+                failed.add(thread.id)
+            except Exception as e:
+                print(f"[admin] thread delete: {type(e).__name__}: {e}")
+        return left
+
+    async def _eject_from_notifier(self, user_id: int, bot_id: str = "") -> bool:
+        manage = await self._manage_channel()
+        threads: list[discord.Thread] = []
+        if manage is not None:
+            threads.extend(list(getattr(manage, "threads", []) or []))
+            try:
+                async for archived in manage.archived_threads(private=True, joined=True, limit=50):
+                    threads.append(archived)
+            except Exception as e:
+                print(f"[admin] thread list: {type(e).__name__}: {e}")
+        mapped = self._thread_map().get(str(user_id))
+        if str(mapped).isdigit():
+            try:
+                fetched = await self.fetch_channel(int(mapped))
+                if isinstance(fetched, discord.Thread):
+                    threads.append(fetched)
+            except Exception:
+                pass
+        seen = set()
+        left = False
+        for thread in threads:
+            if thread.id in seen or thread.name == "Admin":
+                continue
+            seen.add(thread.id)
+            if await self._eject_thread(thread, user_id, bot_id):
+                left = True
+        fresh = self._thread_map()
+        fresh.pop(str(user_id), None)
+        self._save_thread_map(fresh)
+        return left
+
+    def _owner_scanner_token(self, user_id: int) -> str:
+        needle = f"EXOTIC_OWNER_ID={int(user_id)}"
+        roots = [
+            os.path.join(os.path.expanduser("~"), "Downloads"),
+            os.path.join(os.path.expanduser("~"), "Desktop"),
+        ]
+        for base in roots:
+            if not os.path.isdir(base):
+                continue
+            for dirpath, dirnames, names in os.walk(base):
+                depth = dirpath[len(base):].count(os.sep)
+                if depth > 3:
+                    dirnames.clear()
+                    continue
+                dirnames[:] = [name for name in dirnames if name not in {".git", "node_modules", "__pycache__"}]
+                if ".env" not in names:
+                    continue
+                path = os.path.join(dirpath, ".env")
+                try:
+                    text = open(path, encoding="utf-8").read()
+                except Exception:
+                    continue
+                if needle not in text:
+                    continue
+                for line in text.splitlines():
+                    if line.startswith("DISCORD_TOKEN="):
+                        token = line.split("=", 1)[1].strip().strip('"').strip("'")
+                        if token:
+                            return token
+        return ""
+
+    async def _scanner_leave_guild(self, token: str) -> bool:
+        if not token:
+            return False
+        guild = next((item for item in self.guilds if guild_allowed(item.name)), None)
+        if guild is None:
+            return False
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.delete(
+                    f"https://discord.com/api/v10/users/@me/guilds/{guild.id}",
+                    headers={
+                        "Authorization": f"Bot {token}",
+                        "User-Agent": "DiscordBot (https://github.com/potatotoolv2/exotic-notifier, 1.0)",
+                    },
+                    timeout=aiohttp.ClientTimeout(total=15),
+                ) as resp:
+                    if resp.status in {204, 404}:
+                        print("[admin] Scanner left the server.")
+                        return True
+                    print(f"[admin] scanner leave {resp.status}")
+        except Exception as e:
+            print(f"[admin] scanner leave: {type(e).__name__}: {e}")
+        return False
+
+    def _kill_local_scanner(self) -> bool:
+        try:
+            output = subprocess.check_output(
+                [
+                    "powershell",
+                    "-NoProfile",
+                    "-Command",
+                    "Get-CimInstance Win32_Process | "
+                    "Where-Object { $_.Name -match 'python' -and $_.CommandLine -match 'run\\.py|loader\\.py' "
+                    "-and $_.CommandLine -notmatch 'scraper\\\\bot\\.py' } | "
+                    "Select-Object -ExpandProperty ProcessId",
+                ],
+                text=True,
+                timeout=20,
+            )
+        except Exception as e:
+            print(f"[admin] process list: {type(e).__name__}: {e}")
+            return False
+        killed = False
+        for line in output.splitlines():
+            pid = line.strip()
+            if not pid.isdigit():
+                continue
+            try:
+                subprocess.check_call(["taskkill", "/PID", pid, "/T", "/F"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                killed = True
+                print(f"[admin] Stopped scanner process {pid}")
+            except Exception as e:
+                print(f"[admin] stop process: {type(e).__name__}: {e}")
+        return killed
+
+    async def force_stop_scanner(self, user_id: int, bot_id: str = "", token: str = "") -> bool:
+        """End that person's scanner now and take their bot out of the server."""
+        if int(user_id) == ADMIN_ID:
+            return False
+        self._mark_pending_stop(int(user_id))
+        await self._publish_revoked()
+        token = (token or "").strip() or self._owner_scanner_token(int(user_id))
+        left = await self._scanner_leave_guild(token) if token else False
+        killed = self._kill_local_scanner() if token else False
+        if not left and str(bot_id).isdigit():
+            for guild in self.guilds:
+                if not guild_allowed(guild.name):
+                    continue
+                try:
+                    member = guild.get_member(int(bot_id)) or await guild.fetch_member(int(bot_id))
+                    await guild.kick(member, reason="Account reset")
+                    left = True
+                except Exception as e:
+                    print(f"[admin] kick scanner: {type(e).__name__}: {e}")
+        if left or killed:
+            self._clear_pending_stop(int(user_id))
+            await self._publish_revoked()
+        else:
+            async def _drop_later():
+                await asyncio.sleep(90)
+                self._clear_pending_stop(int(user_id))
+                await self._publish_revoked()
+            asyncio.create_task(_drop_later())
+        return left or killed
+
     async def reset_operator(self, user_id: int, name: str = "") -> str:
         if int(user_id) == ADMIN_ID:
             return "The admin account stays."
@@ -4143,17 +4424,10 @@ class ExoticBot(commands.Bot):
                 pass
         username = row.get("name") or name or str(user_id)
         bot_id = str(row.get("bot_id") or "")
-        mapped = self._thread_map()
-        tid = mapped.pop(str(user_id), None)
-        self._save_thread_map(mapped)
-        if tid:
-            try:
-                fetched = await self.fetch_channel(int(tid))
-                if isinstance(fetched, discord.Thread):
-                    await fetched.delete(reason="Account reset")
-                    notes.append("closed their thread")
-            except Exception as e:
-                notes.append(f"thread: {type(e).__name__}")
+        if await self._eject_from_notifier(int(user_id), bot_id):
+            notes.append("left the thread")
+        if await self.force_stop_scanner(int(user_id), bot_id):
+            notes.append("scanner stopped")
         for guild in self.guilds:
             if not guild_allowed(guild.name):
                 continue
@@ -4186,23 +4460,14 @@ class ExoticBot(commands.Bot):
                         await member.remove_roles(access, reason="Account reset")
                     except Exception as e:
                         print(f"[admin] reset role: {type(e).__name__}: {e}")
-            if bot_id.isdigit() and (self.user is None or int(bot_id) != self.user.id):
-                try:
-                    bot_member = guild.get_member(int(bot_id)) or await guild.fetch_member(int(bot_id))
-                    await guild.kick(bot_member, reason="Account reset")
-                    notes.append("kicked their bot")
-                except Exception as e:
-                    notes.append(f"bot: {type(e).__name__}")
         self._forget_operator_stats(int(user_id))
         panels = getattr(self, "_person_panels", None) or {}
         panels.pop(str(user_id), None)
         await self._publish_revoked()
         await self._refresh_admin_panel()
+        await self._dm_account(int(user_id), "reset")
         extra = (". ".join(notes) + ". ") if notes else ""
-        return (
-            f"Reset <@{user_id}>. {extra}"
-            "Close the scanner window on that PC, then they can run `/adduser` again."
-        )
+        return f"Reset <@{user_id}>. {extra}They were DMed."
 
     async def _refresh_admin_panel(self) -> None:
         if not self._is_directory():
@@ -4233,10 +4498,14 @@ class ExoticBot(commands.Bot):
         channel = thread
         if channel is None:
             return
-        ids = sorted(
+        ids = {
             uid for uid, row in (load_operators().get("users") or {}).items()
             if str(uid).isdigit() and (row or {}).get("revoked") and int(uid) != ADMIN_ID
-        )
+        }
+        for uid in load_operators().get("pending_stops") or []:
+            if str(uid).isdigit() and int(uid) != ADMIN_ID:
+                ids.add(str(uid))
+        ids = sorted(ids)
         text = REVOKED_MARKER + ",".join(ids)
         data = load_operators()
         message = None
@@ -4697,8 +4966,12 @@ class ExoticBot(commands.Bot):
         data["users"][str(user_id)] = row
         save_operators(data)
         await self._publish_revoked()
+        bot_id = str(row.get("bot_id") or "")
+        await self._eject_from_notifier(int(user_id), bot_id)
+        await self.force_stop_scanner(int(user_id), bot_id)
         roles = await self._strip_access_roles(int(user_id))
-        bots = await self._silence_bot(str(row.get("bot_id") or ""), int(user_id), row.get("name") or name)
+        bots = await self._silence_bot(bot_id, int(user_id), row.get("name") or name)
+        await self._dm_account(int(user_id), "revoked")
         return f"Revoked <@{user_id}>. Roles: {roles}. {bots}."
 
     async def restore_access(self, user_id: int, name: str = "") -> str:
@@ -4711,6 +4984,7 @@ class ExoticBot(commands.Bot):
         save_operators(data)
         await self._publish_revoked()
         await self._clear_bot_silence(bot_id)
+        await self._dm_account(int(user_id), "restored")
         return (
             f"Restored <@{user_id}>. "
             "They need `/adduser` again if their scanner already shut off."
