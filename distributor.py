@@ -247,8 +247,9 @@ def _python312() -> None:
         print("This needs Python 3.12. Install it from https://www.python.org/downloads/ then run this again.")
         raise SystemExit(1)
     print("Restarting on Python 3.12.")
-    os.environ["EXOTIC_PY_OK"] = "1"
-    os.execv(exe, [exe, "-u", os.path.abspath(__file__)])
+    env = os.environ.copy()
+    env["EXOTIC_PY_OK"] = "1"
+    raise SystemExit(subprocess.call([exe, "-u", os.path.abspath(__file__)], cwd=ROOT, env=env))
 
 
 def _fetch() -> None:
@@ -268,19 +269,42 @@ def _fetch() -> None:
             raise SystemExit(1)
 
 
+def _packages_ready() -> bool:
+    return subprocess.call(
+        [sys.executable, "-c", "import discord, aiohttp, nodriver, dotenv"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    ) == 0
+
+
 def main() -> None:
     _python312()
     if not os.path.isfile(os.path.join(ROOT, ".env")):
         print("Missing .env. Unzip the Discord download and run start from inside that folder.")
         raise SystemExit(1)
+    print("Exotic Notifier")
+    print("Leave this window open. The scanner starts when the download finishes.")
+    print()
     _fetch()
-    print("Installing / updating Python packages...")
-    rc = subprocess.call([sys.executable, "-m", "pip", "install", "-r", "requirements.txt", "-q"])
-    if rc != 0:
-        print("pip install failed.")
-        raise SystemExit(rc)
-    os.environ["EXOTIC_SKIP_WIZARD"] = "1"
-    os.execv(sys.executable, [sys.executable, "-u", os.path.join(ROOT, "bot.py")])
+    if _packages_ready():
+        print("Python packages are ready.")
+    else:
+        print("Installing Python packages...")
+        rc = subprocess.call([sys.executable, "-m", "pip", "install", "-r", "requirements.txt"])
+        if rc != 0:
+            print("pip install failed.")
+            raise SystemExit(rc)
+    env = os.environ.copy()
+    env["EXOTIC_SKIP_WIZARD"] = "1"
+    env["PYTHONUNBUFFERED"] = "1"
+    print()
+    print("Starting the scanner. Leave this window open.")
+    print()
+    raise SystemExit(subprocess.call(
+        [sys.executable, "-u", os.path.join(ROOT, "bot.py")],
+        cwd=ROOT,
+        env=env,
+    ))
 
 
 if __name__ == "__main__":
@@ -365,16 +389,24 @@ exit $status
 START_BAT = r"""@echo off
 cd /d "%~dp0"
 title Exotic Notifier
-where py >nul 2>&1 && (
-    py -3.12 -u loader.py
-    if not errorlevel 1 exit /b 0
-)
-where python >nul 2>&1 && (
-    python -u loader.py
-    if not errorlevel 1 exit /b 0
-)
+echo Exotic Notifier
+echo Leave this window open. One double-click downloads the scanner and starts it.
+echo.
+where py >nul 2>&1
+if errorlevel 1 goto trypython
+py -3.12 -u loader.py
+goto finished
+:trypython
+where python >nul 2>&1
+if errorlevel 1 goto needpython
+python -u loader.py
+goto finished
+:needpython
 echo Install Python 3.12 from https://www.python.org/downloads/ then double-click this file again.
 start https://www.python.org/downloads/release/python-31210/
+:finished
+echo.
+echo The scanner stopped.
 pause
 """
 

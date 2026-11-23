@@ -1625,7 +1625,9 @@ class ManageOpenView(discord.ui.View):
         except Exception as e:
             print(f"[manage] thread: {type(e).__name__}: {e}")
             await interaction.followup.send(
-                "I couldn't open a private thread. phonktester needs permission to create private threads.",
+                "I couldn't open your notifier thread. "
+                "#mange-your-noti denies Create Private Threads for everyone, "
+                "and phonktester can't edit that channel.",
                 ephemeral=True,
             )
             return
@@ -2023,7 +2025,7 @@ class ExoticBot(commands.Bot):
         guilds = list(self.guilds)
         if not guilds:
             print("[Bot] This bot is not in any server yet, so /start has nothing to reach.")
-            print("[Bot] Invite phonktester, then restart Discord.")
+            print("[Bot] Invite this bot, then restart Discord.")
             return
         for guild in guilds:
             try:
@@ -2459,9 +2461,13 @@ class ExoticBot(commands.Bot):
                 print(f"[manage] give {name}: {type(e).__name__}: {e}")
         return role
 
-    async def _user_manage_thread(self, member: discord.Member, manage: discord.TextChannel):
+    def _notifier_thread_name(self, member: discord.Member) -> str:
+        label = (member.display_name or member.name or "notifier").replace("\n", " ")
+        return f"{label}'s notifier"[:100]
+
+    async def _find_notifier_thread(self, member: discord.Member, manage: discord.TextChannel):
+        """Reuse a saved thread, or the one already named for this account."""
         data = self._thread_map()
-        thread = None
         saved = data.get(str(member.id))
         if saved:
             thread = manage.get_thread(int(saved))
@@ -2472,10 +2478,30 @@ class ExoticBot(commands.Bot):
                         thread = fetched
                 except Exception:
                     thread = None
+            if thread is not None:
+                return thread
+        want = self._notifier_thread_name(member)
+        seen = list(getattr(manage, "threads", []) or [])
+        try:
+            for candidate in await manage.guild.active_threads():
+                if candidate.parent_id == manage.id:
+                    seen.append(candidate)
+        except Exception:
+            pass
+        for candidate in seen:
+            if candidate.name == want and candidate.name != "Admin":
+                return candidate
+        return None
+
+    async def _user_manage_thread(self, member: discord.Member, manage: discord.TextChannel):
+        data = self._thread_map()
+        thread = await self._find_notifier_thread(member, manage)
         if thread is not None:
             if thread.archived:
                 await thread.edit(archived=False, locked=False, invitable=False)
             await thread.add_user(member)
+            data[str(member.id)] = thread.id
+            self._save_thread_map(data)
             await self._seat_owner_bot(thread, member)
             return thread
         label = (member.display_name or member.name or "notifier").replace("\n", " ")
@@ -2564,52 +2590,65 @@ class ExoticBot(commands.Bot):
             print(f"[manage] clear channel: {type(e).__name__}: {e}")
         threads = list(getattr(manage, "threads", []) or [])
         try:
+            for candidate in await manage.guild.active_threads():
+                if getattr(candidate, "parent_id", None) == manage.id:
+                    threads.append(candidate)
+        except Exception as e:
+            print(f"[manage] threads: {type(e).__name__}: {e}")
+        try:
             async for archived in manage.archived_threads(private=True, joined=True, limit=20):
                 threads.append(archived)
         except Exception:
             pass
-        thread = None
-        for candidate in threads:
-            if candidate.name in {"Admin", "relay", "ledger", "Claims"}:
-                continue
-            thread = candidate
-            break
         owner = None
         try:
             owner = manage.guild.get_member(int(owner_id)) or await manage.guild.fetch_member(int(owner_id))
         except Exception as e:
             print(f"[manage] owner: {type(e).__name__}: {e}")
-        if thread is None and owner is not None:
+        want = ""
+        if owner is not None:
             label = (owner.display_name or owner.name or "notifier").replace("\n", " ")
+            want = f"{label}'s notifier"[:100]
+        thread = None
+        for candidate in threads:
+            if want and candidate.name == want:
+                thread = candidate
+                break
+        if thread is None:
+            for candidate in threads:
+                if candidate.name in {"Admin", "relay", "ledger", "Claims"}:
+                    continue
+                thread = candidate
+                break
+        if thread is None and owner is not None:
             try:
                 thread = await manage.create_thread(
-                    name=f"{label}'s notifier"[:100],
+                    name=want or "notifier",
                     type=discord.ChannelType.private_thread,
                     invitable=False,
                     auto_archive_duration=4320,
                 )
             except Exception as e:
                 print(f"[manage] create thread: {type(e).__name__}: {e}")
-                return
-        if thread is None:
-            return
-        if thread.archived or getattr(thread, "locked", False):
-            try:
-                await thread.edit(archived=False, locked=False, invitable=False)
-            except Exception:
-                pass
-        if owner is not None:
-            try:
-                await thread.add_user(owner)
-            except Exception as e:
-                print(f"[manage] add owner: {type(e).__name__}: {e}")
-        self._owner_thread = thread
-        await self._post_scanner_status(bool(self.players_to_scan or self.db))
-        if self.players_to_scan or self.db:
+        if thread is not None:
+            if thread.archived or getattr(thread, "locked", False):
+                try:
+                    await thread.edit(archived=False, locked=False, invitable=False)
+                except Exception:
+                    pass
+            if owner is not None:
+                try:
+                    await thread.add_user(owner)
+                except Exception as e:
+                    print(f"[manage] add owner: {type(e).__name__}: {e}")
+            self._owner_thread = thread
+        running = bool(self.players_to_scan or self.db)
+        if running:
             self.ending_session = False
             self.keep_scanning = True
             self._ensure_scanner()
-            print("[start] Scanner started from the owner's thread.")
+            print("[start] Scanner started.")
+        await self._post_scanner_status(running)
 
     async def _post_scanner_status(self, running: bool) -> None:
         """One status line in the owner's thread. A new ping only when it changes."""
@@ -2617,14 +2656,19 @@ class ExoticBot(commands.Bot):
             return
         if getattr(self, "_status_running", None) == running:
             return
+        self._status_running = running
+        owner_id = (os.getenv("EXOTIC_OWNER_ID") or "").strip()
+        told_host = False
+        if running and owner_id.isdigit():
+            told_host = await self._send_relay(f"live:{owner_id}")
         thread = getattr(self, "_owner_thread", None)
         if thread is None:
             return
-        self._status_running = running
-        owner_id = (os.getenv("EXOTIC_OWNER_ID") or "").strip()
-        mention = f"<@{owner_id}> " if owner_id.isdigit() else ""
         mark = "🟢" if running else "🔴"
         state = "running" if running else "not running"
+        mention = ""
+        if running and not told_host and owner_id.isdigit():
+            mention = f"<@{owner_id}> "
         content = f"{mention}{mark} Scanner is {state}."
         try:
             async for msg in thread.history(limit=30):
@@ -2708,8 +2752,8 @@ class ExoticBot(commands.Bot):
             "Windows: `start.bat`\n"
             "Mac: `Start ExoticNotifier.command`\n"
             "If Mac says it cannot be opened, right-click the file, choose Open, then Open.\n"
-            "The loader downloads the scanner and starts your bot. "
-            "One small Chrome window opens. Leave that window open. Do not start the loader twice.\n\n"
+            "That file downloads the scanner and starts it in the same window. "
+            "Leave the window open. One small Chrome window opens. Do not start it twice.\n\n"
             "**6. Open your thread**\n"
             f"When your bot is in the server, open {manage_bit} and click **Open my notifier**.\n"
             "Run `/start` and `/stop` in that thread on **your** bot.\n\n"
@@ -3421,7 +3465,7 @@ class ExoticBot(commands.Bot):
         chunks = [(message.content or "").strip()]
         chunks.extend((embed.description or "").strip() for embed in message.embeds)
         for chunk in chunks:
-            for prefix in ("pulse:", "stat:", "recent:", "notichannel:"):
+            for prefix in ("pulse:", "stat:", "recent:", "notichannel:", "live:"):
                 at = chunk.find(prefix)
                 if at >= 0:
                     return chunk[at:].strip()
@@ -3440,7 +3484,69 @@ class ExoticBot(commands.Bot):
             except Exception as e:
                 print(f"[relay] read: {type(e).__name__}: {e}")
 
+    async def _ping_panel(self, user_id: int) -> None:
+        """Mention them once in their notifier thread when their scanner is running."""
+        if not self._is_directory() or int(user_id) == ADMIN_ID:
+            return
+        sent = getattr(self, "_running_pings", None)
+        if sent is None:
+            sent = set()
+            self._running_pings = sent
+        if int(user_id) in sent:
+            return
+        manage = await self._manage_channel()
+        if manage is None:
+            return
+        thread = None
+        mapped = self._thread_map().get(str(user_id))
+        if str(mapped).isdigit():
+            thread = manage.get_thread(int(mapped))
+            if thread is None:
+                try:
+                    fetched = await self.fetch_channel(int(mapped))
+                    if isinstance(fetched, discord.Thread):
+                        thread = fetched
+                except Exception:
+                    thread = None
+        if thread is None:
+            try:
+                member = manage.guild.get_member(int(user_id)) or await manage.guild.fetch_member(int(user_id))
+                want = self._notifier_thread_name(member)
+                for candidate in await manage.guild.active_threads():
+                    if candidate.parent_id == manage.id and candidate.name == want:
+                        thread = candidate
+                        break
+            except Exception:
+                thread = None
+        if thread is None:
+            print(f"[manage] no panel to ping for {user_id}")
+            return
+        if thread.archived or getattr(thread, "locked", False):
+            try:
+                await thread.edit(archived=False, locked=False, invitable=False)
+            except Exception:
+                pass
+        try:
+            member = manage.guild.get_member(int(user_id)) or await manage.guild.fetch_member(int(user_id))
+            await thread.add_user(member)
+        except Exception:
+            pass
+        try:
+            await thread.send(
+                f"<@{int(user_id)}> 🟢 Scanner is running.",
+                allowed_mentions=discord.AllowedMentions(users=[discord.Object(id=int(user_id))]),
+            )
+            sent.add(int(user_id))
+            print(f"[manage] pinged {user_id} in {thread.name}")
+        except Exception as e:
+            print(f"[manage] ping: {type(e).__name__}: {e}")
+
     async def _ingest_relay(self, message: discord.Message, text: str) -> None:
+        if text.startswith("live:"):
+            oid = text.split(":", 2)[1] if ":" in text else ""
+            if oid.isdigit():
+                await self._ping_panel(int(oid))
+            return
         if text.startswith("pulse:"):
             row = parse_pulse(text)
             if row is None:
@@ -3500,6 +3606,15 @@ class ExoticBot(commands.Bot):
             await self._upsert_person_card(int(oid))
         except Exception as e:
             print(f"[relay] card: {type(e).__name__}: {e}")
+        if parsed["scanning"] and not bool(old.get("scanning")):
+            try:
+                await self._ping_panel(int(oid))
+            except Exception as e:
+                print(f"[manage] ping: {type(e).__name__}: {e}")
+        elif not parsed["scanning"]:
+            pings = getattr(self, "_running_pings", None)
+            if pings is not None:
+                pings.discard(int(oid))
 
     async def _send_relay(self, line: str) -> bool:
         if self._is_directory():
@@ -3575,7 +3690,7 @@ class ExoticBot(commands.Bot):
                     raw = msg.content or ""
                     relay = self._relay_text(msg)
                     age = (discord.utils.utcnow() - msg.created_at).total_seconds()
-                    is_line = relay.startswith(("pulse:", "stat:", "recent:"))
+                    is_line = relay.startswith(("pulse:", "stat:", "recent:", "live:"))
                     is_board = (
                         title == "Scan activity"
                         or (title and "Scan leaderboard" in title)
@@ -3924,7 +4039,7 @@ class ExoticBot(commands.Bot):
                 f"[relay] {message.author} embeds={len(message.embeds)} "
                 f"content={bool(message.content)} line={text[:24]!r}"
             )
-            if text.startswith(("pulse:", "stat:")):
+            if text.startswith(("pulse:", "stat:", "live:")):
                 await self._ingest_relay(message, text)
             elif text.startswith("claim:"):
                 await self._publish_relay_claim(text)
@@ -4286,8 +4401,17 @@ class ExoticBot(commands.Bot):
             if await self._eject_thread(thread, user_id, bot_id):
                 left = True
         fresh = self._thread_map()
-        fresh.pop(str(user_id), None)
-        self._save_thread_map(fresh)
+        mapped = fresh.get(str(user_id))
+        still_there = False
+        if str(mapped).isdigit():
+            try:
+                fetched = await self.fetch_channel(int(mapped))
+                still_there = isinstance(fetched, discord.Thread)
+            except Exception:
+                still_there = False
+        if not still_there:
+            fresh.pop(str(user_id), None)
+            self._save_thread_map(fresh)
         return left
 
     def _owner_scanner_token(self, user_id: int) -> str:
