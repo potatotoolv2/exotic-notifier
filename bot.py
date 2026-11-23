@@ -2651,38 +2651,26 @@ class ExoticBot(commands.Bot):
         await self._post_scanner_status(running)
 
     async def _post_scanner_status(self, running: bool) -> None:
-        """One status line in the owner's thread. A new ping only when it changes."""
+        """Tell phonktester the scanner changed. phonktester is the only ping in the thread."""
         if self._is_directory():
             return
         if getattr(self, "_status_running", None) == running:
             return
         self._status_running = running
         owner_id = (os.getenv("EXOTIC_OWNER_ID") or "").strip()
-        told_host = False
-        if running and owner_id.isdigit():
-            told_host = await self._send_relay(f"live:{owner_id}")
         thread = getattr(self, "_owner_thread", None)
-        if thread is None:
-            return
-        mark = "🟢" if running else "🔴"
-        state = "running" if running else "not running"
-        mention = ""
-        if running and not told_host and owner_id.isdigit():
-            mention = f"<@{owner_id}> "
-        content = f"{mention}{mark} Scanner is {state}."
-        try:
-            async for msg in thread.history(limit=30):
-                if msg.author != self.user:
-                    continue
-                text = msg.content or ""
-                if "Scanner is running" in text or "Scanner is not running" in text:
-                    await msg.delete()
-        except Exception as e:
-            print(f"[manage] status clear: {type(e).__name__}: {e}")
-        try:
-            await thread.send(content, allowed_mentions=discord.AllowedMentions(users=True))
-        except Exception as e:
-            print(f"[manage] status: {type(e).__name__}: {e}")
+        if thread is not None:
+            try:
+                async for msg in thread.history(limit=30):
+                    if msg.author != self.user:
+                        continue
+                    text = msg.content or ""
+                    if "Scanner is running" in text or "Scanner is not running" in text:
+                        await msg.delete()
+            except Exception as e:
+                print(f"[manage] status clear: {type(e).__name__}: {e}")
+        if owner_id.isdigit():
+            await self._send_relay(f"live:{owner_id}:{1 if running else 0}")
 
     async def _sync_manage_bots(self) -> None:
         if not self._is_directory():
@@ -3484,16 +3472,14 @@ class ExoticBot(commands.Bot):
             except Exception as e:
                 print(f"[relay] read: {type(e).__name__}: {e}")
 
-    async def _ping_panel(self, user_id: int) -> None:
-        """Mention them once in their notifier thread when their scanner is running."""
+    async def _ping_panel(self, user_id: int, running: bool = True) -> None:
+        """One status line from phonktester. The mention happens only when it starts."""
         if not self._is_directory() or int(user_id) == ADMIN_ID:
             return
         sent = getattr(self, "_running_pings", None)
         if sent is None:
             sent = set()
             self._running_pings = sent
-        if int(user_id) in sent:
-            return
         manage = await self._manage_channel()
         if manage is None:
             return
@@ -3531,21 +3517,50 @@ class ExoticBot(commands.Bot):
             await thread.add_user(member)
         except Exception:
             pass
+        own = None
         try:
-            await thread.send(
-                f"<@{int(user_id)}> 🟢 Scanner is running.",
-                allowed_mentions=discord.AllowedMentions(users=[discord.Object(id=int(user_id))]),
-            )
-            sent.add(int(user_id))
-            print(f"[manage] pinged {user_id} in {thread.name}")
+            async for msg in thread.history(limit=20):
+                if msg.author != self.user:
+                    continue
+                text = msg.content or ""
+                if "Scanner is running" in text or "Scanner is not running" in text:
+                    own = msg
+                    break
         except Exception as e:
-            print(f"[manage] ping: {type(e).__name__}: {e}")
+            print(f"[manage] status read: {type(e).__name__}: {e}")
+        if running:
+            if int(user_id) in sent or (own is not None and "Scanner is running" in (own.content or "")):
+                sent.add(int(user_id))
+                return
+            try:
+                await thread.send(
+                    f"<@{int(user_id)}> 🟢 Scanner is running.",
+                    allowed_mentions=discord.AllowedMentions(users=[discord.Object(id=int(user_id))]),
+                )
+                sent.add(int(user_id))
+                print(f"[manage] pinged {user_id} in {thread.name}")
+            except Exception as e:
+                print(f"[manage] ping: {type(e).__name__}: {e}")
+            return
+        sent.discard(int(user_id))
+        if own is None:
+            return
+        if "Scanner is not running" in (own.content or ""):
+            return
+        try:
+            await own.edit(
+                content="🔴 Scanner is not running.",
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except Exception as e:
+            print(f"[manage] status: {type(e).__name__}: {e}")
 
     async def _ingest_relay(self, message: discord.Message, text: str) -> None:
         if text.startswith("live:"):
-            oid = text.split(":", 2)[1] if ":" in text else ""
-            if oid.isdigit():
-                await self._ping_panel(int(oid))
+            parts = text.split(":")
+            if len(parts) > 1 and parts[1].isdigit():
+                running = len(parts) < 3 or parts[2] != "0"
+                await self._ping_panel(int(parts[1]), running)
             return
         if text.startswith("pulse:"):
             row = parse_pulse(text)
@@ -3611,10 +3626,11 @@ class ExoticBot(commands.Bot):
                 await self._ping_panel(int(oid))
             except Exception as e:
                 print(f"[manage] ping: {type(e).__name__}: {e}")
-        elif not parsed["scanning"]:
-            pings = getattr(self, "_running_pings", None)
-            if pings is not None:
-                pings.discard(int(oid))
+        elif not parsed["scanning"] and bool(old.get("scanning")):
+            try:
+                await self._ping_panel(int(oid), False)
+            except Exception as e:
+                print(f"[manage] status: {type(e).__name__}: {e}")
 
     async def _send_relay(self, line: str) -> bool:
         if self._is_directory():
